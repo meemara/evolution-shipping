@@ -79,8 +79,15 @@ function NameSelector({
   employees: Employee[];
   onSelect: (emp: Employee) => void;
 }) {
+  const [selected, setSelected] = useState('');
+
+  function handleContinue() {
+    const emp = employees.find((e) => String(e.id) === selected);
+    if (emp) onSelect(emp);
+  }
+
   return (
-    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+    <div className="fixed inset-0 flex items-center justify-center z-50" style={{ background: 'var(--evo-navy)' }}>
       <div className="bg-white rounded-xl shadow-2xl p-8 w-full max-w-sm mx-4">
         <h2 className="text-xl font-bold mb-1" style={{ color: 'var(--evo-navy)' }}>
           Evolution Shipping Tracker
@@ -88,23 +95,27 @@ function NameSelector({
         <p className="text-sm mb-6" style={{ color: 'var(--evo-gray-500)' }}>
           Select your name to continue
         </p>
-        <div className="flex flex-col gap-2">
+        <select
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+          className="w-full px-4 py-3 border rounded-lg text-sm font-medium focus:outline-none focus:ring-2 focus:ring-blue-400 mb-4"
+          style={{ borderColor: 'var(--evo-gray-300)', color: selected ? 'var(--evo-gray-900)' : 'var(--evo-gray-400)' }}
+        >
+          <option value="" disabled>Choose your name...</option>
           {employees.map((emp) => (
-            <button
-              key={emp.id}
-              onClick={() => onSelect(emp)}
-              className="text-left px-4 py-3 rounded-lg border transition-all hover:border-blue-400 hover:bg-blue-50"
-              style={{ borderColor: 'var(--evo-gray-200)' }}
-            >
-              <span className="font-medium">{emp.name}</span>
-              {emp.role === 'admin' && (
-                <span className="ml-2 text-xs px-2 py-0.5 rounded-full bg-blue-100 text-blue-700">
-                  Admin
-                </span>
-              )}
-            </button>
+            <option key={emp.id} value={String(emp.id)}>
+              {emp.name}
+            </option>
           ))}
-        </div>
+        </select>
+        <button
+          onClick={handleContinue}
+          disabled={!selected}
+          className="w-full px-4 py-3 rounded-lg text-white text-sm font-medium transition-colors disabled:opacity-40"
+          style={{ background: 'var(--evo-blue)' }}
+        >
+          Continue
+        </button>
       </div>
     </div>
   );
