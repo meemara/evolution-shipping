@@ -91,21 +91,13 @@ export async function POST(request: Request) {
 
 // Vercel Cron handler
 export async function GET(request: Request) {
-  // Cron jobs call GET — redirect to POST with the sync secret
   const secret = process.env.SYNC_SECRET;
   if (!secret) {
     return NextResponse.json({ error: 'SYNC_SECRET not configured' }, { status: 500 });
   }
 
-  const url = new URL(request.url);
-  const authHeader = request.headers.get('authorization');
-
-  // Verify this is actually from Vercel Cron
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
-
   // Call our own POST handler
+  const url = new URL(request.url);
   const syncUrl = `${url.origin}/api/sync?secret=${secret}&days=2`;
   const res = await fetch(syncUrl, { method: 'POST' });
   const data = await res.json();
