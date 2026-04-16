@@ -591,6 +591,14 @@ export default function Home() {
           <h1 className="text-xl font-bold text-white tracking-tight">Evolution Shipping Tracker</h1>
         </div>
         <div className="flex items-center gap-4">
+          {isAdmin && (
+            <a
+              href="/admin"
+              className="text-sm text-blue-300 hover:text-white transition-colors"
+            >
+              Manage Employees
+            </a>
+          )}
           <button
             onClick={() => handleViewLog()}
             className="text-sm text-blue-300 hover:text-white transition-colors"
