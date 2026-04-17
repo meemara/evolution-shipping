@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { sql } from '@vercel/postgres';
-import { fetchShippingEmails, parseShippingEmail, dedupeKey } from '@/lib/graph';
+import { fetchShippingEmails, parseShippingEmail, mergeOrders } from '@/lib/graph';
 
 // Vercel Cron calls this endpoint on schedule
 // Also callable manually: POST /api/sync?days=7
@@ -27,45 +27,99 @@ export async function POST(request: Request) {
       .map(parseShippingEmail)
       .filter((o): o is NonNullable<typeof o> => o !== null);
 
-    // Deduplicate within this batch
-    const seen = new Map<string, typeof parsed[0]>();
-    for (const order of parsed) {
-      const key = dedupeKey(order);
-      if (!seen.has(key)) {
-        seen.set(key, order);
-      }
-    }
-    const unique = Array.from(seen.values());
+    // Merge related orders (e.g., FedEx tracking email + Lutron order email = one order)
+    const merged = mergeOrders(parsed);
 
-    // Check existing orders in DB to avoid duplicates
+    // Get all existing orders from DB for matching
     const { rows: existingOrders } = await sql`
-      SELECT order_number, tracking_number, vendor FROM orders
+      SELECT id, order_number, tracking_number, vendor, carrier, estimated_delivery, project, status FROM orders
     `;
 
-    const existingKeys = new Set<string>();
+    // Build lookup indexes for existing orders
+    const dbByTracking = new Map<string, typeof existingOrders[0]>();
+    const dbByOrderVendor = new Map<string, typeof existingOrders[0]>();
+
     for (const row of existingOrders) {
-      if (row.tracking_number) existingKeys.add(`tracking:${row.tracking_number}`);
-      if (row.order_number) existingKeys.add(`order:${row.vendor}:${row.order_number}`);
+      if (row.tracking_number) dbByTracking.set(row.tracking_number, row);
+      if (row.order_number && row.vendor) {
+        dbByOrderVendor.set(`${row.vendor}:${row.order_number}`, row);
+      }
     }
 
-    // Insert only new orders
     let inserted = 0;
+    let updated = 0;
     let skipped = 0;
 
-    for (const order of unique) {
-      const key = dedupeKey(order);
-      if (existingKeys.has(key)) {
-        skipped++;
-        continue;
+    for (const order of merged) {
+      // Try to find an existing DB row that matches this order
+      let existingRow: typeof existingOrders[0] | undefined;
+
+      // Match by tracking number
+      if (order.tracking_number) {
+        existingRow = dbByTracking.get(order.tracking_number);
       }
 
-      await sql`
-        INSERT INTO orders (vendor, description, order_number, order_date, tracking_number, carrier, status, estimated_delivery, project, notes, created_by)
-        VALUES (${order.vendor}, ${order.description}, ${order.order_number}, ${order.order_date}, ${order.tracking_number}, ${order.carrier}, ${order.status}, ${order.estimated_delivery}, ${order.project}, ${order.notes}, ${order.created_by})
-      `;
+      // Match by order number + vendor
+      if (!existingRow && order.order_number && order.vendor) {
+        existingRow = dbByOrderVendor.get(`${order.vendor}:${order.order_number}`);
+      }
 
-      existingKeys.add(key);
-      inserted++;
+      // Also check if a carrier email's tracking matches an existing order without tracking
+      // by looking for matching PO in order_number field
+      if (!existingRow && order.po_number) {
+        for (const row of existingOrders) {
+          if (row.order_number && row.order_number.includes(order.po_number)) {
+            existingRow = row;
+            break;
+          }
+        }
+      }
+
+      if (existingRow) {
+        // Check if we have new info to add
+        const hasNewTracking = order.tracking_number && !existingRow.tracking_number;
+        const hasNewCarrier = order.carrier && !existingRow.carrier;
+        const hasNewDelivery = order.estimated_delivery && !existingRow.estimated_delivery;
+        const hasNewProject = order.project && !existingRow.project;
+        const hasNewerStatus = order.status && order.status !== existingRow.status;
+
+        // Status priority for determining if new status is more recent
+        const statusPriority: Record<string, number> = {
+          'Order Confirmed': 1, 'Shipped': 2, 'In Transit': 3,
+          'Out for Delivery': 4, 'Delivered': 5
+        };
+        const isNewerStatus = hasNewerStatus &&
+          (statusPriority[order.status] || 0) > (statusPriority[existingRow.status] || 0);
+
+        if (hasNewTracking || hasNewCarrier || hasNewDelivery || hasNewProject || isNewerStatus) {
+          await sql`
+            UPDATE orders SET
+              tracking_number = COALESCE(${order.tracking_number ?? existingRow.tracking_number}, tracking_number),
+              carrier = COALESCE(${order.carrier ?? existingRow.carrier}, carrier),
+              estimated_delivery = COALESCE(${order.estimated_delivery ?? existingRow.estimated_delivery}, estimated_delivery),
+              project = COALESCE(${order.project ?? existingRow.project}, project),
+              status = ${isNewerStatus ? order.status : existingRow.status}
+            WHERE id = ${existingRow.id}
+          `;
+          updated++;
+        } else {
+          skipped++;
+        }
+      } else {
+        // Insert new order
+        await sql`
+          INSERT INTO orders (vendor, description, order_number, order_date, tracking_number, carrier, status, estimated_delivery, project, notes, created_by)
+          VALUES (${order.vendor}, ${order.description}, ${order.order_number}, ${order.order_date}, ${order.tracking_number}, ${order.carrier}, ${order.status}, ${order.estimated_delivery}, ${order.project}, ${order.notes}, ${order.created_by})
+        `;
+
+        // Add to lookup indexes for rest of this batch
+        if (order.tracking_number) dbByTracking.set(order.tracking_number, { id: -1, ...order } as any);
+        if (order.order_number && order.vendor) {
+          dbByOrderVendor.set(`${order.vendor}:${order.order_number}`, { id: -1, ...order } as any);
+        }
+
+        inserted++;
+      }
     }
 
     // Log the sync
@@ -73,8 +127,9 @@ export async function POST(request: Request) {
       timestamp: new Date().toISOString(),
       emailsFetched: emails.length,
       emailsParsed: parsed.length,
-      uniqueOrders: unique.length,
+      mergedOrders: merged.length,
       inserted,
+      updated,
       skipped,
       sinceDateStr,
     };

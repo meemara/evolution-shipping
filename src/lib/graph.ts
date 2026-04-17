@@ -68,6 +68,10 @@ export interface ParsedOrder {
   project: string | null;
   notes: string;
   created_by: string;
+  // Cross-reference fields for merging
+  po_number: string | null;
+  raw_order_number: string | null;
+  is_carrier_email: boolean;
 }
 
 // Fetch recent emails from the shipping shared mailbox
@@ -216,9 +220,6 @@ export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
     }
   }
 
-  // Build order number string
-  const orderNumStr = [orderNumber, poNumber ? `PO: ${poNumber}` : null].filter(Boolean).join(' / ') || null;
-
   // Build description
   let description = subject
     .replace(/^(FW:|Fw:|RE:|Re:)\s*/gi, '')
@@ -230,6 +231,43 @@ export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
   if (vendor === 'UPS') {
     const shipperMatch = fullBody.match(/From\s+<strong>(.+?)<\/strong>/i) || body.match(/From\s+(\S.+?)(?:\s+Estimated|\s*$)/);
     if (shipperMatch) description = `Package from ${shipperMatch[1]}`;
+  }
+
+  // For carrier emails (FedEx/UPS), try to extract PO or order references from the body
+  // so we can match them to vendor orders later
+  const isCarrierEmail = vendor === 'FedEx' || vendor === 'UPS';
+  if (isCarrierEmail) {
+    // Look for PO references in the body
+    const bodyPoMatch = (body + ' ' + fullBody).match(/PO#?\s*[-:]?\s*([A-Z0-9]+)/i);
+    if (bodyPoMatch && !poNumber) poNumber = bodyPoMatch[1].trim();
+
+    // Look for order number references
+    const bodyOrderMatch = (body + ' ' + fullBody).match(/(?:Order|Reference)\s*#?\s*[-:]?\s*(\d{6,})/i);
+    if (bodyOrderMatch && !orderNumber) orderNumber = bodyOrderMatch[1];
+
+    // Look for ship-to project name references
+    const shipToMatch = fullBody.match(/(?:Ship\s*To|Deliver\s*To|Attention)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
+    if (shipToMatch && !project) {
+      project = shipToMatch[1].trim();
+    }
+
+    // Look for shipper name that might be a vendor
+    const shipperVendorMatch = fullBody.match(/(?:From|Shipper)[:\s]+(?:<[^>]*>)?\s*(Lutron|Crestron|Sonance|Legrand|Wesco|Synnex|SnapOne)/i);
+    if (shipperVendorMatch) {
+      // Store original vendor for the carrier, but note the actual shipper
+      description = `${shipperVendorMatch[1]} shipment via ${vendor}`;
+    }
+  }
+
+  // Rebuild order number string with any newly found data
+  const orderNumStr = [orderNumber, poNumber ? `PO: ${poNumber}` : null].filter(Boolean).join(' / ') || null;
+
+  // Extract project from PO if we still don't have one
+  if (!project && poNumber) {
+    const nameNumMatch2 = poNumber.match(/^([A-Z]+)(\d+)$/i);
+    if (nameNumMatch2 && nameNumMatch2[1].length > 2) {
+      project = nameNumMatch2[1].charAt(0).toUpperCase() + nameNumMatch2[1].slice(1).toLowerCase();
+    }
   }
 
   return {
@@ -244,6 +282,9 @@ export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
     project,
     notes: `Imported from email: ${subject}`,
     created_by: 'System Import',
+    po_number: poNumber,
+    raw_order_number: orderNumber,
+    is_carrier_email: isCarrierEmail,
   };
 }
 
@@ -255,4 +296,156 @@ export function dedupeKey(order: ParsedOrder): string {
   if (order.order_number) return `order:${order.vendor}:${order.order_number}`;
   // Fallback: vendor + date + description hash
   return `fallback:${order.vendor}:${order.order_date}:${order.description.substring(0, 50)}`;
+}
+
+// Merge parsed orders from multiple emails about the same shipment into single entries.
+// A carrier email (FedEx/UPS) should merge into a vendor order if they share a PO, order number, or tracking number.
+export function mergeOrders(orders: ParsedOrder[]): ParsedOrder[] {
+  // Separate vendor orders from carrier-only emails
+  const vendorOrders: ParsedOrder[] = [];
+  const carrierOrders: ParsedOrder[] = [];
+
+  for (const order of orders) {
+    if (order.is_carrier_email) {
+      carrierOrders.push(order);
+    } else {
+      vendorOrders.push(order);
+    }
+  }
+
+  // Build lookup indexes for vendor orders
+  const byTracking = new Map<string, number>(); // tracking -> index in vendorOrders
+  const byPo = new Map<string, number>(); // PO number -> index
+  const byOrderNum = new Map<string, number>(); // raw order number -> index
+
+  for (let i = 0; i < vendorOrders.length; i++) {
+    const o = vendorOrders[i];
+    if (o.tracking_number) byTracking.set(o.tracking_number, i);
+    if (o.po_number) byPo.set(o.po_number.toUpperCase(), i);
+    if (o.raw_order_number) byOrderNum.set(o.raw_order_number, i);
+  }
+
+  // Try to merge each carrier email into a matching vendor order
+  const unmatchedCarrier: ParsedOrder[] = [];
+
+  for (const carrier of carrierOrders) {
+    let matchIdx: number | undefined;
+
+    // Match by tracking number
+    if (carrier.tracking_number && byTracking.has(carrier.tracking_number)) {
+      matchIdx = byTracking.get(carrier.tracking_number);
+    }
+
+    // Match by PO number
+    if (matchIdx === undefined && carrier.po_number) {
+      matchIdx = byPo.get(carrier.po_number.toUpperCase());
+    }
+
+    // Match by raw order number
+    if (matchIdx === undefined && carrier.raw_order_number) {
+      matchIdx = byOrderNum.get(carrier.raw_order_number);
+    }
+
+    if (matchIdx !== undefined) {
+      // Merge: fill in missing fields on the vendor order with carrier data
+      const target = vendorOrders[matchIdx];
+      if (!target.tracking_number && carrier.tracking_number) {
+        target.tracking_number = carrier.tracking_number;
+      }
+      if (!target.carrier && carrier.carrier) {
+        target.carrier = carrier.carrier;
+      }
+      if (!target.estimated_delivery && carrier.estimated_delivery) {
+        target.estimated_delivery = carrier.estimated_delivery;
+      }
+      if (!target.project && carrier.project) {
+        target.project = carrier.project;
+      }
+      // Update status if carrier has more recent info
+      const statusPriority: Record<string, number> = {
+        'Order Confirmed': 1, 'Shipped': 2, 'In Transit': 3,
+        'Out for Delivery': 4, 'Delivered': 5
+      };
+      const carrierPriority = statusPriority[carrier.status] || 0;
+      const targetPriority = statusPriority[target.status] || 0;
+      if (carrierPriority > targetPriority) {
+        target.status = carrier.status;
+      }
+      // Update the tracking index so future carrier emails can also match
+      if (target.tracking_number) {
+        byTracking.set(target.tracking_number, matchIdx);
+      }
+    } else {
+      unmatchedCarrier.push(carrier);
+    }
+  }
+
+  // Also merge vendor orders that share the same PO number (e.g., Lutron order + Lutron shipment)
+  const finalOrders: ParsedOrder[] = [];
+  const mergedVendorIndexes = new Set<number>();
+
+  for (let i = 0; i < vendorOrders.length; i++) {
+    if (mergedVendorIndexes.has(i)) continue;
+
+    const order = vendorOrders[i];
+
+    // Look for other vendor orders with the same PO
+    if (order.po_number) {
+      for (let j = i + 1; j < vendorOrders.length; j++) {
+        if (mergedVendorIndexes.has(j)) continue;
+        const other = vendorOrders[j];
+        if (other.po_number && other.po_number.toUpperCase() === order.po_number.toUpperCase()) {
+          // Merge other into order
+          if (!order.tracking_number && other.tracking_number) order.tracking_number = other.tracking_number;
+          if (!order.carrier && other.carrier) order.carrier = other.carrier;
+          if (!order.estimated_delivery && other.estimated_delivery) order.estimated_delivery = other.estimated_delivery;
+          if (!order.project && other.project) order.project = other.project;
+          if (!order.raw_order_number && other.raw_order_number) order.raw_order_number = other.raw_order_number;
+          if (!order.order_number && other.order_number) order.order_number = other.order_number;
+          // Take the more complete order number string
+          if (other.order_number && order.order_number && other.order_number.length > order.order_number.length) {
+            order.order_number = other.order_number;
+          }
+          // Take the better description (prefer vendor over generic)
+          if (order.vendor === 'Unknown' && other.vendor !== 'Unknown') {
+            order.vendor = other.vendor;
+            order.description = other.description;
+          }
+          const statusPriority: Record<string, number> = {
+            'Order Confirmed': 1, 'Shipped': 2, 'In Transit': 3,
+            'Out for Delivery': 4, 'Delivered': 5
+          };
+          if ((statusPriority[other.status] || 0) > (statusPriority[order.status] || 0)) {
+            order.status = other.status;
+          }
+          mergedVendorIndexes.add(j);
+        }
+      }
+    }
+
+    // Also check if any vendor orders share the same tracking number
+    if (order.tracking_number) {
+      for (let j = i + 1; j < vendorOrders.length; j++) {
+        if (mergedVendorIndexes.has(j)) continue;
+        const other = vendorOrders[j];
+        if (other.tracking_number === order.tracking_number) {
+          if (!order.po_number && other.po_number) order.po_number = other.po_number;
+          if (!order.project && other.project) order.project = other.project;
+          if (!order.order_number && other.order_number) order.order_number = other.order_number;
+          if (order.vendor === 'Unknown' && other.vendor !== 'Unknown') {
+            order.vendor = other.vendor;
+            order.description = other.description;
+          }
+          mergedVendorIndexes.add(j);
+        }
+      }
+    }
+
+    finalOrders.push(order);
+  }
+
+  // Add unmatched carrier emails as their own entries
+  finalOrders.push(...unmatchedCarrier);
+
+  return finalOrders;
 }
