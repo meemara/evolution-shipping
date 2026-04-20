@@ -55,6 +55,9 @@ export async function POST() {
       ON CONFLICT (name) DO NOTHING
     `;
 
+    // Add sender_email column if it doesn't exist
+    await sql`ALTER TABLE orders ADD COLUMN IF NOT EXISTS sender_email VARCHAR(255)`;
+
     // Create indexes
     await sql`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`;
     await sql`CREATE INDEX IF NOT EXISTS idx_change_log_order ON change_log(order_id)`;

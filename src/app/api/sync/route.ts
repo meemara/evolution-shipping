@@ -19,6 +19,9 @@ export async function POST(request: Request) {
     sinceDate.setDate(sinceDate.getDate() - days);
     const sinceDateStr = sinceDate.toISOString();
 
+    // Ensure sender_email column exists (migration)
+    await sql`ALTER TABLE orders ADD COLUMN IF NOT EXISTS sender_email VARCHAR(255)`.catch(() => {});
+
     // Fetch emails from shipping mailbox
     const emails = await fetchShippingEmails(sinceDateStr);
 
@@ -32,7 +35,7 @@ export async function POST(request: Request) {
 
     // Get all existing orders from DB for matching
     const { rows: existingOrders } = await sql`
-      SELECT id, order_number, tracking_number, vendor, carrier, estimated_delivery, project, status, description FROM orders
+      SELECT id, order_number, tracking_number, vendor, carrier, estimated_delivery, project, status, description, sender_email FROM orders
     `;
 
     // Build lookup indexes for existing orders
@@ -98,6 +101,7 @@ export async function POST(request: Request) {
         const hasNewCarrier = order.carrier && !existingRow.carrier;
         const hasNewDelivery = order.estimated_delivery && !existingRow.estimated_delivery;
         const hasNewProject = order.project && !existingRow.project;
+        const hasNewSender = order.sender_email && !existingRow.sender_email;
         const hasNewerStatus = order.status && order.status !== existingRow.status;
 
         // Status priority for determining if new status is more recent
@@ -108,13 +112,14 @@ export async function POST(request: Request) {
         const isNewerStatus = hasNewerStatus &&
           (statusPriority[order.status] || 0) > (statusPriority[existingRow.status] || 0);
 
-        if (hasNewTracking || hasNewCarrier || hasNewDelivery || hasNewProject || isNewerStatus) {
+        if (hasNewTracking || hasNewCarrier || hasNewDelivery || hasNewProject || hasNewSender || isNewerStatus) {
           await sql`
             UPDATE orders SET
               tracking_number = COALESCE(${order.tracking_number ?? existingRow.tracking_number}, tracking_number),
               carrier = COALESCE(${order.carrier ?? existingRow.carrier}, carrier),
               estimated_delivery = COALESCE(${order.estimated_delivery ?? existingRow.estimated_delivery}, estimated_delivery),
               project = COALESCE(${order.project ?? existingRow.project}, project),
+              sender_email = COALESCE(${order.sender_email ?? existingRow.sender_email}, sender_email),
               status = ${isNewerStatus ? order.status : existingRow.status}
             WHERE id = ${existingRow.id}
           `;
@@ -125,8 +130,8 @@ export async function POST(request: Request) {
       } else {
         // Insert new order
         await sql`
-          INSERT INTO orders (vendor, description, order_number, order_date, tracking_number, carrier, status, estimated_delivery, project, notes, created_by)
-          VALUES (${order.vendor}, ${order.description}, ${order.order_number}, ${order.order_date}, ${order.tracking_number}, ${order.carrier}, ${order.status}, ${order.estimated_delivery}, ${order.project}, ${order.notes}, ${order.created_by})
+          INSERT INTO orders (vendor, description, order_number, order_date, tracking_number, carrier, status, estimated_delivery, project, notes, created_by, sender_email)
+          VALUES (${order.vendor}, ${order.description}, ${order.order_number}, ${order.order_date}, ${order.tracking_number}, ${order.carrier}, ${order.status}, ${order.estimated_delivery}, ${order.project}, ${order.notes}, ${order.created_by}, ${order.sender_email})
         `;
 
         // Add to lookup indexes for rest of this batch

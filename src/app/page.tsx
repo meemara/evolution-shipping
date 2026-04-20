@@ -21,6 +21,7 @@ interface Order {
   estimated_delivery: string | null;
   actual_delivery: string | null;
   project: string | null;
+  sender_email: string | null;
   notes: string | null;
   created_by: string;
   created_at: string;
@@ -681,6 +682,7 @@ export default function Home() {
               <th className="text-left px-4 py-3 font-semibold" style={{ color: 'var(--evo-gray-600)' }}>Vendor</th>
               <th className="text-left px-4 py-3 font-semibold" style={{ color: 'var(--evo-gray-600)' }}>Description</th>
               <th className="text-left px-4 py-3 font-semibold" style={{ color: 'var(--evo-gray-600)' }}>Project</th>
+              <th className="text-left px-4 py-3 font-semibold" style={{ color: 'var(--evo-gray-600)' }}>From</th>
               <th className="text-left px-4 py-3 font-semibold" style={{ color: 'var(--evo-gray-600)' }}>Status</th>
               <th className="text-left px-4 py-3 font-semibold" style={{ color: 'var(--evo-gray-600)' }}>Carrier</th>
               <th className="text-left px-4 py-3 font-semibold" style={{ color: 'var(--evo-gray-600)' }}>Tracking</th>
@@ -691,7 +693,7 @@ export default function Home() {
           <tbody>
             {filteredOrders.length === 0 ? (
               <tr>
-                <td colSpan={8} className="px-4 py-12 text-center" style={{ color: 'var(--evo-gray-400)' }}>
+                <td colSpan={9} className="px-4 py-12 text-center" style={{ color: 'var(--evo-gray-400)' }}>
                   {orders.length === 0
                     ? 'No orders yet. Add one to get started.'
                     : 'No orders match your filters.'}
@@ -715,6 +717,9 @@ export default function Home() {
                   </td>
                   <td className="px-4 py-3" style={{ color: 'var(--evo-gray-600)' }}>
                     {order.project || '—'}
+                  </td>
+                  <td className="px-4 py-3 text-xs" style={{ color: 'var(--evo-gray-500)' }}>
+                    {order.sender_email || '—'}
                   </td>
                   <td className="px-4 py-3">
                     <span className={`inline-block px-2.5 py-1 rounded-full text-xs font-medium ${statusClass(order.status)}`}>

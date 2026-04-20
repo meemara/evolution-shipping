@@ -68,6 +68,7 @@ export interface ParsedOrder {
   project: string | null;
   notes: string;
   created_by: string;
+  sender_email: string | null;
   // Cross-reference fields for merging
   po_number: string | null;
   raw_order_number: string | null;
@@ -296,6 +297,7 @@ export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
     project,
     notes: `Imported from email: ${subject}`,
     created_by: 'System Import',
+    sender_email: email.sender?.emailAddress?.address || null,
     po_number: poNumber,
     raw_order_number: orderNumber,
     is_carrier_email: isCarrierEmail,
@@ -320,6 +322,7 @@ function mergeInto(target: ParsedOrder, source: ParsedOrder): void {
   if (!target.project && source.project) target.project = source.project;
   if (!target.raw_order_number && source.raw_order_number) target.raw_order_number = source.raw_order_number;
   if (!target.po_number && source.po_number) target.po_number = source.po_number;
+  if (!target.sender_email && source.sender_email) target.sender_email = source.sender_email;
   if (!target.order_number && source.order_number) target.order_number = source.order_number;
   // Take the more complete order number string
   if (source.order_number && target.order_number && source.order_number.length > target.order_number.length) {
