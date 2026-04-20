@@ -25,6 +25,13 @@ export async function POST(request: Request) {
          OR (vendor = 'Unknown' AND tracking_number IS NULL AND order_number IS NULL AND (description IS NULL OR LENGTH(description) < 15))
     `;
 
+    // Remove orders where the sender is an internal/personal email (forwarded but couldn't find original sender)
+    const { rowCount: internalRemoved } = await sql`
+      DELETE FROM orders
+      WHERE sender_email LIKE '%@evolutionava.com'
+         OR sender_email LIKE '%@evolutionav.com'
+    `;
+
     // Get all remaining orders
     const { rows: allOrders } = await sql`
       SELECT id, vendor, description, order_number, order_date, tracking_number, carrier, status, estimated_delivery, project
@@ -152,7 +159,7 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json({
-      junkRemoved: junkRemoved || 0,
+      junkRemoved: (junkRemoved || 0) + (internalRemoved || 0),
       totalOrdersAfterJunk: allOrders.length,
       duplicatesRemoved: deleted,
       ordersUpdatedWithMergedData: updated,

@@ -525,6 +525,36 @@ export default function Home() {
     }
   }
 
+  async function handleBlockSender(order: Order) {
+    const senderEmail = order.sender_email;
+    if (!senderEmail) {
+      alert('No sender email on this order to block.');
+      return;
+    }
+    if (!confirm(`Block all emails from "${senderEmail}" and delete all their orders? Future emails from this sender will be ignored.`)) return;
+    try {
+      const res = await fetch('/api/blocked-senders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: senderEmail,
+          blocked_by: currentUser!.name,
+          reason: 'Blocked from shipping tracker',
+          delete_orders: true,
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        alert(`Blocked ${senderEmail}. ${data.ordersDeleted} order(s) removed.`);
+        await fetchOrders();
+      } else {
+        alert('Failed to block sender: ' + (data.error || 'Unknown error'));
+      }
+    } catch (err) {
+      alert('Failed to block sender: ' + err);
+    }
+  }
+
   async function handleViewLog(orderId?: number) {
     try {
       const url = orderId ? `/api/changelog?orderId=${orderId}` : '/api/changelog';
@@ -761,12 +791,22 @@ export default function Home() {
                         Log
                       </button>
                       {isAdmin && (
-                        <button
-                          onClick={() => handleDeleteOrder(order.id)}
-                          className="text-xs px-2 py-1 rounded border border-red-200 text-red-500 transition-colors hover:bg-red-50"
-                        >
-                          Delete
-                        </button>
+                        <>
+                          <button
+                            onClick={() => handleDeleteOrder(order.id)}
+                            className="text-xs px-2 py-1 rounded border border-red-200 text-red-500 transition-colors hover:bg-red-50"
+                          >
+                            Delete
+                          </button>
+                          {order.sender_email && (
+                            <button
+                              onClick={() => handleBlockSender(order)}
+                              className="text-xs px-2 py-1 rounded border border-orange-200 text-orange-600 transition-colors hover:bg-orange-50"
+                            >
+                              Block
+                            </button>
+                          )}
+                        </>
                       )}
                     </div>
                   </td>

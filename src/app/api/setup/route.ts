@@ -58,6 +58,17 @@ export async function POST() {
     // Add sender_email column if it doesn't exist
     await sql`ALTER TABLE orders ADD COLUMN IF NOT EXISTS sender_email VARCHAR(255)`;
 
+    // Create blocked senders table
+    await sql`
+      CREATE TABLE IF NOT EXISTS blocked_senders (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        blocked_by VARCHAR(100) NOT NULL,
+        reason VARCHAR(255),
+        blocked_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+
     // Create indexes
     await sql`CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)`;
     await sql`CREATE INDEX IF NOT EXISTS idx_change_log_order ON change_log(order_id)`;

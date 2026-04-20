@@ -25,10 +25,24 @@ export async function POST(request: Request) {
     // Fetch emails from shipping mailbox
     const emails = await fetchShippingEmails(sinceDateStr);
 
-    // Parse each email into order data
+    // Get blocked senders list
+    await sql`CREATE TABLE IF NOT EXISTS blocked_senders (id SERIAL PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE, blocked_by VARCHAR(100) NOT NULL, reason VARCHAR(255), blocked_at TIMESTAMP DEFAULT NOW())`.catch(() => {});
+    const { rows: blockedRows } = await sql`SELECT email FROM blocked_senders`;
+    const blockedEmails = new Set(blockedRows.map(r => r.email.toLowerCase()));
+
+    // Internal domains — skip orders that resolve to an internal sender (means we couldn't find the original)
+    const internalDomains = ['evolutionava.com', 'evolutionav.com'];
+
+    // Parse each email into order data, skipping blocked and internal senders
     const parsed = emails
       .map(parseShippingEmail)
-      .filter((o): o is NonNullable<typeof o> => o !== null);
+      .filter((o): o is NonNullable<typeof o> => {
+        if (o === null) return false;
+        if (o.sender_email && blockedEmails.has(o.sender_email.toLowerCase())) return false;
+        // Skip if sender resolved to an internal email (forwarded but couldn't extract original)
+        if (o.sender_email && internalDomains.some(d => o.sender_email!.toLowerCase().includes(d))) return false;
+        return true;
+      });
 
     // Merge related orders (e.g., FedEx tracking email + Lutron order email = one order)
     const merged = mergeOrders(parsed);
