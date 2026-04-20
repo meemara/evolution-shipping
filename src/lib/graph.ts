@@ -99,6 +99,54 @@ export async function fetchShippingEmails(sinceDate: string): Promise<GraphEmail
   return allEmails;
 }
 
+// Extract the original sender from a forwarded email.
+// If the email was forwarded by an internal employee, dig into the body for the real "From:" line.
+function extractOriginalSender(email: GraphEmail, vendor: string): string | null {
+  const directSender = email.sender?.emailAddress?.address?.toLowerCase() || '';
+  const fullBody = email.body?.content || '';
+  const bodyText = email.bodyPreview || '';
+
+  // Known internal domains — if the sender is internal, this is a forwarded email
+  const internalDomains = ['evolutionava.com', 'evolutionav.com', 'gmail.com', 'bigskybuilders.com', 'bigskybuild.com'];
+  const isInternal = internalDomains.some(d => directSender.includes(d));
+
+  if (!isInternal) {
+    // Direct from vendor/carrier — use the actual sender
+    return directSender;
+  }
+
+  // This was forwarded — look for the original "From:" in the email body
+  // Common patterns in forwarded email bodies:
+  // "From: orders@lutron.com" or "From: Someone <orders@lutron.com>"
+  const fromPatterns = [
+    // HTML: <b>From:</b> Name &lt;email@domain.com&gt;
+    /From:<\/[^>]*>\s*[^<]*?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?/i,
+    // Plain: From: Name <email@domain.com>
+    /From:\s*[^<\n]*?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?/i,
+    // "Sender:" variant
+    /Sender:\s*[^<\n]*?<?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})>?/i,
+  ];
+
+  for (const pattern of fromPatterns) {
+    const match = (fullBody + ' ' + bodyText).match(pattern);
+    if (match) {
+      const foundEmail = match[1].toLowerCase();
+      // Make sure we're not just re-matching the internal forwarder
+      const isAlsoInternal = internalDomains.some(d => foundEmail.includes(d));
+      if (!isAlsoInternal) {
+        return foundEmail;
+      }
+    }
+  }
+
+  // Couldn't find original sender in body — fall back to vendor name if known
+  if (vendor !== 'Unknown') {
+    return vendor.toLowerCase().replace(/\s+/g, '') + ' (from email)';
+  }
+
+  return directSender;
+}
+
 // Parse a shipping email into a structured order
 export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
   const subject = email.subject || '';
@@ -297,7 +345,7 @@ export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
     project,
     notes: `Imported from email: ${subject}`,
     created_by: 'System Import',
-    sender_email: email.sender?.emailAddress?.address || null,
+    sender_email: extractOriginalSender(email, vendor),
     po_number: poNumber,
     raw_order_number: orderNumber,
     is_carrier_email: isCarrierEmail,
