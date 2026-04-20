@@ -196,7 +196,7 @@ export async function POST(request: Request) {
         else if (cOrder.status === 'In Progress') trackerStatus = 'In Transit';
         else if (cOrder.status === 'Shipped') trackerStatus = 'Shipped';
 
-        await sql`
+        const insertResult = await sql`
           INSERT INTO orders (vendor, description, order_number, order_date, tracking_number,
                              carrier, status, estimated_delivery, project, notes, created_by)
           VALUES (
@@ -212,7 +212,23 @@ export async function POST(request: Request) {
             ${`Source: Crestron Portal | PO: ${cOrder.po_number || 'N/A'}`},
             'crestron-sync'
           )
+          RETURNING id, order_number, tracking_number, vendor, carrier,
+                    estimated_delivery, project, status, description, notes
         `;
+        // Add newly inserted row to lookup indexes so subsequent records
+        // for the same order enrich instead of inserting duplicates
+        if (insertResult.rows.length > 0) {
+          const newRow = insertResult.rows[0];
+          existingOrders.push(newRow);
+          if (newRow.tracking_number) {
+            dbByTracking.set(newRow.tracking_number, newRow);
+          }
+          if (newRow.order_number) {
+            const existing = dbByOrderNumber.get(newRow.order_number) || [];
+            existing.push(newRow);
+            dbByOrderNumber.set(newRow.order_number, existing);
+          }
+        }
         inserted++;
         details.push(`Inserted new: Crestron #${cOrder.order_number} (${cOrder.project || 'no project'})`);
       } else {
