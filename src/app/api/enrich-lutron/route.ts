@@ -188,7 +188,7 @@ export async function POST(request: Request) {
         else if (lOrder.status === 'In Queue' || lOrder.status === 'In Picking') trackerStatus = 'Processing';
         else if (lOrder.status === 'Waiting for Carrier Pickup') trackerStatus = 'Ready for Pickup';
 
-        await sql`
+        const insertResult = await sql`
           INSERT INTO orders (vendor, description, order_number, order_date, tracking_number,
                              carrier, status, estimated_delivery, project, notes, created_by)
           VALUES (
@@ -204,7 +204,23 @@ export async function POST(request: Request) {
             ${`Source: Lutron Portal | PO: ${lOrder.po_number || 'N/A'}${lOrder.ship_origin ? ` | Origin: ${lOrder.ship_origin}` : ''}`},
             'lutron-sync'
           )
+          RETURNING id, order_number, tracking_number, vendor, carrier,
+                    estimated_delivery, project, status, description, notes
         `;
+        // Add the newly inserted row to lookup indexes so subsequent records
+        // for the same order number enrich instead of inserting duplicates
+        if (insertResult.rows.length > 0) {
+          const newRow = insertResult.rows[0];
+          existingOrders.push(newRow);
+          if (newRow.tracking_number) {
+            dbByTracking.set(newRow.tracking_number, newRow);
+          }
+          if (newRow.order_number) {
+            const existing = dbByOrderNumber.get(newRow.order_number) || [];
+            existing.push(newRow);
+            dbByOrderNumber.set(newRow.order_number, existing);
+          }
+        }
         inserted++;
         details.push(`Inserted new: Lutron #${lOrder.order_number} (${lOrder.project || lOrder.po_number || 'no project'})`);
       } else {
