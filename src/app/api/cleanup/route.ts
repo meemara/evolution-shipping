@@ -13,7 +13,14 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    // Get all orders
+    // First: remove junk entries with no useful data
+    const { rowCount: junkRemoved } = await sql`
+      DELETE FROM orders
+      WHERE (description = 'script' OR description = '' OR description IS NULL)
+         OR (vendor = 'Unknown' AND tracking_number IS NULL AND order_number IS NULL AND (description IS NULL OR LENGTH(description) < 15))
+    `;
+
+    // Get all remaining orders
     const { rows: allOrders } = await sql`
       SELECT id, vendor, description, order_number, order_date, tracking_number, carrier, status, estimated_delivery, project
       FROM orders
@@ -140,7 +147,8 @@ export async function POST(request: Request) {
     }
 
     return NextResponse.json({
-      totalOrders: allOrders.length,
+      junkRemoved: junkRemoved || 0,
+      totalOrdersAfterJunk: allOrders.length,
       duplicatesRemoved: deleted,
       ordersUpdatedWithMergedData: updated,
       remainingOrders: allOrders.length - deleted,
