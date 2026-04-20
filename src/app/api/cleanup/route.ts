@@ -13,6 +13,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
+    // If ?reset_senders=true, clear all sender_email values so sync can repopulate them
+    if (searchParams.get('reset_senders') === 'true') {
+      await sql`UPDATE orders SET sender_email = NULL`;
+    }
+
     // First: remove junk entries with no useful data
     const { rowCount: junkRemoved } = await sql`
       DELETE FROM orders
