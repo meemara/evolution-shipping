@@ -106,7 +106,7 @@ export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
   const fullBody = email.body?.content || '';
   const date = email.receivedDateTime?.split('T')[0] || null;
 
-  // Determine vendor
+  // Determine vendor — check sender first, then fall back to subject/body keywords
   let vendor = 'Unknown';
   if (sender.includes('lutron.com')) vendor = 'Lutron';
   else if (sender.includes('ups.com')) vendor = 'UPS';
@@ -117,6 +117,20 @@ export function parseShippingEmail(email: GraphEmail): ParsedOrder | null {
   else if (sender.includes('wesco')) vendor = 'Wesco';
   else if (sender.includes('synnex') || sender.includes('tdsynnex')) vendor = 'TD SYNNEX';
   else if (sender.includes('snapone') || sender.includes('snap-one')) vendor = 'SnapOne';
+  else if (sender.includes('environmentallights')) vendor = 'Environmental Lights';
+
+  // If sender didn't match, check subject and body for vendor names (handles forwarded emails)
+  if (vendor === 'Unknown') {
+    const combined = (subject + ' ' + body + ' ' + fullBody).toLowerCase();
+    if (combined.includes('lutron')) vendor = 'Lutron';
+    else if (combined.includes('crestron')) vendor = 'Crestron';
+    else if (combined.includes('sonance')) vendor = 'Sonance';
+    else if (combined.includes('legrand')) vendor = 'Legrand';
+    else if (combined.includes('environmentallights')) vendor = 'Environmental Lights';
+    else if (combined.includes('snapone') || combined.includes('snap one') || combined.includes('snap-one')) vendor = 'SnapOne';
+    else if (combined.includes('wesco')) vendor = 'Wesco';
+    else if (combined.includes('synnex') || combined.includes('td synnex')) vendor = 'TD SYNNEX';
+  }
 
   // Skip non-shipping emails
   const lowerSubject = subject.toLowerCase();
@@ -298,154 +312,108 @@ export function dedupeKey(order: ParsedOrder): string {
   return `fallback:${order.vendor}:${order.order_date}:${order.description.substring(0, 50)}`;
 }
 
+// Helper: merge fields from source into target, filling in blanks
+function mergeInto(target: ParsedOrder, source: ParsedOrder): void {
+  if (!target.tracking_number && source.tracking_number) target.tracking_number = source.tracking_number;
+  if (!target.carrier && source.carrier) target.carrier = source.carrier;
+  if (!target.estimated_delivery && source.estimated_delivery) target.estimated_delivery = source.estimated_delivery;
+  if (!target.project && source.project) target.project = source.project;
+  if (!target.raw_order_number && source.raw_order_number) target.raw_order_number = source.raw_order_number;
+  if (!target.po_number && source.po_number) target.po_number = source.po_number;
+  if (!target.order_number && source.order_number) target.order_number = source.order_number;
+  // Take the more complete order number string
+  if (source.order_number && target.order_number && source.order_number.length > target.order_number.length) {
+    target.order_number = source.order_number;
+  }
+  // Prefer known vendor over Unknown
+  if (target.vendor === 'Unknown' && source.vendor !== 'Unknown') {
+    target.vendor = source.vendor;
+    target.description = source.description;
+  }
+  // Update status if source has more recent info
+  const statusPriority: Record<string, number> = {
+    'Order Confirmed': 1, 'Shipped': 2, 'In Transit': 3,
+    'Out for Delivery': 4, 'Delivered': 5
+  };
+  if ((statusPriority[source.status] || 0) > (statusPriority[target.status] || 0)) {
+    target.status = source.status;
+  }
+}
+
+// Normalize a description for comparison (strip FW:/RE:, lowercase, trim whitespace)
+function normalizeDescription(desc: string): string {
+  return desc
+    .replace(/^(FW:|Fw:|RE:|Re:)\s*/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 // Merge parsed orders from multiple emails about the same shipment into single entries.
-// A carrier email (FedEx/UPS) should merge into a vendor order if they share a PO, order number, or tracking number.
+// Catches: same tracking, same PO, same order number, same forwarded email (identical subject),
+// and carrier emails (FedEx/UPS) that should merge into vendor orders.
 export function mergeOrders(orders: ParsedOrder[]): ParsedOrder[] {
-  // Separate vendor orders from carrier-only emails
-  const vendorOrders: ParsedOrder[] = [];
-  const carrierOrders: ParsedOrder[] = [];
+  const result: ParsedOrder[] = [];
+  const merged = new Set<number>(); // indexes in orders[] that have been merged into another
 
-  for (const order of orders) {
-    if (order.is_carrier_email) {
-      carrierOrders.push(order);
-    } else {
-      vendorOrders.push(order);
-    }
-  }
+  // Build indexes for fast lookup
+  const byTracking = new Map<string, number>(); // tracking -> index in result
+  const byPo = new Map<string, number>();
+  const byOrderNum = new Map<string, number>();
+  const byDescription = new Map<string, number>(); // normalized description -> index in result
 
-  // Build lookup indexes for vendor orders
-  const byTracking = new Map<string, number>(); // tracking -> index in vendorOrders
-  const byPo = new Map<string, number>(); // PO number -> index
-  const byOrderNum = new Map<string, number>(); // raw order number -> index
-
-  for (let i = 0; i < vendorOrders.length; i++) {
-    const o = vendorOrders[i];
-    if (o.tracking_number) byTracking.set(o.tracking_number, i);
-    if (o.po_number) byPo.set(o.po_number.toUpperCase(), i);
-    if (o.raw_order_number) byOrderNum.set(o.raw_order_number, i);
-  }
-
-  // Try to merge each carrier email into a matching vendor order
-  const unmatchedCarrier: ParsedOrder[] = [];
-
-  for (const carrier of carrierOrders) {
+  for (let i = 0; i < orders.length; i++) {
+    if (merged.has(i)) continue;
+    const order = orders[i];
     let matchIdx: number | undefined;
 
-    // Match by tracking number
-    if (carrier.tracking_number && byTracking.has(carrier.tracking_number)) {
-      matchIdx = byTracking.get(carrier.tracking_number);
+    // Try to find an existing result entry to merge into
+    // 1. Match by tracking number
+    if (order.tracking_number && byTracking.has(order.tracking_number)) {
+      matchIdx = byTracking.get(order.tracking_number);
     }
 
-    // Match by PO number
-    if (matchIdx === undefined && carrier.po_number) {
-      matchIdx = byPo.get(carrier.po_number.toUpperCase());
+    // 2. Match by PO number
+    if (matchIdx === undefined && order.po_number) {
+      matchIdx = byPo.get(order.po_number.toUpperCase());
     }
 
-    // Match by raw order number
-    if (matchIdx === undefined && carrier.raw_order_number) {
-      matchIdx = byOrderNum.get(carrier.raw_order_number);
+    // 3. Match by raw order number (within same vendor or if one is a carrier)
+    if (matchIdx === undefined && order.raw_order_number) {
+      matchIdx = byOrderNum.get(order.raw_order_number);
+    }
+
+    // 4. Match by normalized description (catches forwarded duplicates)
+    if (matchIdx === undefined) {
+      const normDesc = normalizeDescription(order.description);
+      if (normDesc.length > 10) { // only match on meaningful descriptions
+        matchIdx = byDescription.get(normDesc);
+      }
     }
 
     if (matchIdx !== undefined) {
-      // Merge: fill in missing fields on the vendor order with carrier data
-      const target = vendorOrders[matchIdx];
-      if (!target.tracking_number && carrier.tracking_number) {
-        target.tracking_number = carrier.tracking_number;
-      }
-      if (!target.carrier && carrier.carrier) {
-        target.carrier = carrier.carrier;
-      }
-      if (!target.estimated_delivery && carrier.estimated_delivery) {
-        target.estimated_delivery = carrier.estimated_delivery;
-      }
-      if (!target.project && carrier.project) {
-        target.project = carrier.project;
-      }
-      // Update status if carrier has more recent info
-      const statusPriority: Record<string, number> = {
-        'Order Confirmed': 1, 'Shipped': 2, 'In Transit': 3,
-        'Out for Delivery': 4, 'Delivered': 5
-      };
-      const carrierPriority = statusPriority[carrier.status] || 0;
-      const targetPriority = statusPriority[target.status] || 0;
-      if (carrierPriority > targetPriority) {
-        target.status = carrier.status;
-      }
-      // Update the tracking index so future carrier emails can also match
-      if (target.tracking_number) {
-        byTracking.set(target.tracking_number, matchIdx);
-      }
+      // Merge into existing
+      mergeInto(result[matchIdx], order);
+      merged.add(i);
+
+      // Update indexes with any new data
+      const target = result[matchIdx];
+      if (target.tracking_number) byTracking.set(target.tracking_number, matchIdx);
+      if (target.po_number) byPo.set(target.po_number.toUpperCase(), matchIdx);
+      if (target.raw_order_number) byOrderNum.set(target.raw_order_number, matchIdx);
     } else {
-      unmatchedCarrier.push(carrier);
+      // New unique order
+      const idx = result.length;
+      result.push(order);
+
+      // Add to indexes
+      if (order.tracking_number) byTracking.set(order.tracking_number, idx);
+      if (order.po_number) byPo.set(order.po_number.toUpperCase(), idx);
+      if (order.raw_order_number) byOrderNum.set(order.raw_order_number, idx);
+      const normDesc = normalizeDescription(order.description);
+      if (normDesc.length > 10) byDescription.set(normDesc, idx);
     }
   }
 
-  // Also merge vendor orders that share the same PO number (e.g., Lutron order + Lutron shipment)
-  const finalOrders: ParsedOrder[] = [];
-  const mergedVendorIndexes = new Set<number>();
-
-  for (let i = 0; i < vendorOrders.length; i++) {
-    if (mergedVendorIndexes.has(i)) continue;
-
-    const order = vendorOrders[i];
-
-    // Look for other vendor orders with the same PO
-    if (order.po_number) {
-      for (let j = i + 1; j < vendorOrders.length; j++) {
-        if (mergedVendorIndexes.has(j)) continue;
-        const other = vendorOrders[j];
-        if (other.po_number && other.po_number.toUpperCase() === order.po_number.toUpperCase()) {
-          // Merge other into order
-          if (!order.tracking_number && other.tracking_number) order.tracking_number = other.tracking_number;
-          if (!order.carrier && other.carrier) order.carrier = other.carrier;
-          if (!order.estimated_delivery && other.estimated_delivery) order.estimated_delivery = other.estimated_delivery;
-          if (!order.project && other.project) order.project = other.project;
-          if (!order.raw_order_number && other.raw_order_number) order.raw_order_number = other.raw_order_number;
-          if (!order.order_number && other.order_number) order.order_number = other.order_number;
-          // Take the more complete order number string
-          if (other.order_number && order.order_number && other.order_number.length > order.order_number.length) {
-            order.order_number = other.order_number;
-          }
-          // Take the better description (prefer vendor over generic)
-          if (order.vendor === 'Unknown' && other.vendor !== 'Unknown') {
-            order.vendor = other.vendor;
-            order.description = other.description;
-          }
-          const statusPriority: Record<string, number> = {
-            'Order Confirmed': 1, 'Shipped': 2, 'In Transit': 3,
-            'Out for Delivery': 4, 'Delivered': 5
-          };
-          if ((statusPriority[other.status] || 0) > (statusPriority[order.status] || 0)) {
-            order.status = other.status;
-          }
-          mergedVendorIndexes.add(j);
-        }
-      }
-    }
-
-    // Also check if any vendor orders share the same tracking number
-    if (order.tracking_number) {
-      for (let j = i + 1; j < vendorOrders.length; j++) {
-        if (mergedVendorIndexes.has(j)) continue;
-        const other = vendorOrders[j];
-        if (other.tracking_number === order.tracking_number) {
-          if (!order.po_number && other.po_number) order.po_number = other.po_number;
-          if (!order.project && other.project) order.project = other.project;
-          if (!order.order_number && other.order_number) order.order_number = other.order_number;
-          if (order.vendor === 'Unknown' && other.vendor !== 'Unknown') {
-            order.vendor = other.vendor;
-            order.description = other.description;
-          }
-          mergedVendorIndexes.add(j);
-        }
-      }
-    }
-
-    finalOrders.push(order);
-  }
-
-  // Add unmatched carrier emails as their own entries
-  finalOrders.push(...unmatchedCarrier);
-
-  return finalOrders;
+  return result;
 }

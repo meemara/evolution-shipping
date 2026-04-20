@@ -32,7 +32,7 @@ export async function POST(request: Request) {
 
     // Get all existing orders from DB for matching
     const { rows: existingOrders } = await sql`
-      SELECT id, order_number, tracking_number, vendor, carrier, estimated_delivery, project, status FROM orders
+      SELECT id, order_number, tracking_number, vendor, carrier, estimated_delivery, project, status, description FROM orders
     `;
 
     // Build lookup indexes for existing orders
@@ -64,13 +64,30 @@ export async function POST(request: Request) {
         existingRow = dbByOrderVendor.get(`${order.vendor}:${order.order_number}`);
       }
 
-      // Also check if a carrier email's tracking matches an existing order without tracking
-      // by looking for matching PO in order_number field
+      // Match by PO number appearing in order_number field
       if (!existingRow && order.po_number) {
         for (const row of existingOrders) {
           if (row.order_number && row.order_number.includes(order.po_number)) {
             existingRow = row;
             break;
+          }
+        }
+      }
+
+      // Match by similar description (catches forwarded duplicates already in DB)
+      if (!existingRow && order.description) {
+        const normDesc = order.description
+          .replace(/^(FW:|Fw:|RE:|Re:)\s*/gi, '')
+          .replace(/\s+/g, ' ').trim().toLowerCase();
+        if (normDesc.length > 10) {
+          for (const row of existingOrders) {
+            const rowDesc = (row.description || '')
+              .replace(/^(FW:|Fw:|RE:|Re:)\s*/gi, '')
+              .replace(/\s+/g, ' ').trim().toLowerCase();
+            if (rowDesc === normDesc) {
+              existingRow = row;
+              break;
+            }
           }
         }
       }
