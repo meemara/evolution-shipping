@@ -63,6 +63,11 @@ export async function getEmployee(name: string): Promise<Employee | null> {
   return (rows[0] as Employee) || null;
 }
 
+export async function isAdmin(employeeId: number): Promise<boolean> {
+  const { rows } = await sql`SELECT role FROM employees WHERE id = ${employeeId}`;
+  return rows.length > 0 && rows[0].role === 'admin';
+}
+
 export async function addEmployee(name: string, role: string = 'viewer'): Promise<Employee> {
   const { rows } = await sql`
     INSERT INTO employees (name, role) VALUES (${name}, ${role})

@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { sql } from '@vercel/postgres';
+import { isAdmin } from '@/lib/db';
 
 // GET: list all blocked senders
 export async function GET() {
@@ -26,10 +27,14 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { email, blocked_by, reason, delete_orders } = body;
+    const { email, blocked_by, reason, delete_orders, user_id } = body;
 
     if (!email || !blocked_by) {
       return NextResponse.json({ error: 'email and blocked_by are required' }, { status: 400 });
+    }
+
+    if (!user_id || !(await isAdmin(parseInt(user_id)))) {
+      return NextResponse.json({ error: 'Only admins can block senders' }, { status: 403 });
     }
 
     // Create table if it doesn't exist

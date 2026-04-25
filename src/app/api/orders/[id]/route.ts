@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getOrder, updateOrder, deleteOrder } from '@/lib/db';
+import { getOrder, updateOrder, deleteOrder, isAdmin } from '@/lib/db';
 
 export async function GET(
   request: Request,
@@ -46,6 +46,11 @@ export async function DELETE(
 ) {
   try {
     const { id } = await params;
+    const url = new URL(request.url);
+    const userId = url.searchParams.get('user_id');
+    if (!userId || !(await isAdmin(parseInt(userId)))) {
+      return NextResponse.json({ error: 'Only admins can delete orders' }, { status: 403 });
+    }
     const deleted = await deleteOrder(parseInt(id));
     if (!deleted) {
       return NextResponse.json({ error: 'Order not found' }, { status: 404 });

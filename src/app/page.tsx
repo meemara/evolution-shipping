@@ -518,7 +518,7 @@ export default function Home() {
   async function handleDeleteOrder(id: number) {
     if (!confirm('Delete this order? This cannot be undone.')) return;
     try {
-      await fetch(`/api/orders/${id}`, { method: 'DELETE' });
+      await fetch(`/api/orders/${id}?user_id=${currentUser!.id}`, { method: 'DELETE' });
       await fetchOrders();
     } catch (err) {
       alert('Failed to delete: ' + err);
@@ -541,6 +541,7 @@ export default function Home() {
           blocked_by: currentUser!.name,
           reason: 'Blocked from shipping tracker',
           delete_orders: true,
+          user_id: currentUser!.id,
         }),
       });
       const data = await res.json();
