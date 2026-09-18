@@ -164,6 +164,8 @@ export async function POST(request: Request) {
     const dryRun = searchParams.get('dry_run') === 'true';
     const ageDays = parseInt(searchParams.get('age_days') || '7');
     const deleteDelivered = searchParams.get('delete') !== 'false'; // default true
+    // Explicit override for the blast-radius guard below. Off unless asked for.
+    const force = searchParams.get('force') === 'true';
 
     // Get all orders with tracking numbers not already marked delivered
     const { rows: orders } = await sql`
@@ -231,26 +233,56 @@ export async function POST(request: Request) {
       }
     }
 
-    // Age-based fallback: if order is older than ageDays and has tracking, consider it delivered
+    // Which tracking numbers actually got a real answer from the carrier?
+    // A failed lookup must NOT feed the age rule. Otherwise a carrier outage
+    // silently reclassifies "could not verify" as "old enough to delete", which is
+    // how a broken UPS/FedEx integration can empty the entire tracker. (2026-09-18)
+    const lookupOk = new Set(
+      apiResults
+        .filter(r => !String(r.status || '').startsWith('API error'))
+        .map(r => r.tracking_number)
+    );
+
+    // Age-based rule: only applies to orders the carrier actually answered for.
     const ageThreshold = new Date();
     ageThreshold.setDate(ageThreshold.getDate() - ageDays);
 
     const agedOutIds: number[] = [];
+    let ageSkippedUnverified = 0;
     for (const order of orders) {
-      if (deliveredIds.includes(order.id)) continue; // already confirmed
+      if (deliveredIds.includes(order.id)) continue; // already confirmed by carrier
       const orderDate = new Date(order.created_at);
-      if (orderDate < ageThreshold) {
-        agedOutIds.push(order.id);
+      if (!(orderDate < ageThreshold)) continue;
+      if (!lookupOk.has(order.tracking_number || '')) {
+        // Old, but we never got a usable carrier response for it. Leave it alone.
+        ageSkippedUnverified++;
+        continue;
       }
+      agedOutIds.push(order.id);
     }
 
     // Combined list of IDs to remove
     const allDeliveredIds = [...new Set([...deliveredIds, ...agedOutIds])];
 
+    // Hard blast-radius guard. This used to exist only as a sentence in a Cowork
+    // task prompt -- an instruction to a model, not code. If a run would remove
+    // more than half the tracker, it removes nothing and says so. (2026-09-18)
+    const MAX_REMOVAL_FRACTION = 0.5;
+    const removalFraction = orders.length > 0 ? allDeliveredIds.length / orders.length : 0;
+    const guardTripped = !force && removalFraction > MAX_REMOVAL_FRACTION;
+
+    if (guardTripped) {
+      console.warn(
+        `SAFETY GUARD: run would remove ${allDeliveredIds.length}/${orders.length} ` +
+        `(${(removalFraction * 100).toFixed(1)}%) of tracked orders. Nothing removed. ` +
+        `Re-run with &force=true only if this is genuinely intended.`
+      );
+    }
+
     let deleted = 0;
     let statusUpdated = 0;
 
-    if (!dryRun && allDeliveredIds.length > 0) {
+    if (!dryRun && !guardTripped && allDeliveredIds.length > 0) {
       if (deleteDelivered) {
         // Delete delivered orders and their change logs
         for (const id of allDeliveredIds) {
@@ -292,6 +324,11 @@ export async function POST(request: Request) {
       },
       apiConfirmedDelivered: deliveredIds.length,
       agedOutDelivered: agedOutIds.length,
+      ageSkippedUnverified,
+      carrierLookupsOk: lookupOk.size,
+      carrierLookupsFailed: apiResults.length - lookupOk.size,
+      guardTripped,
+      removalFraction: Number(removalFraction.toFixed(3)),
       totalDelivered: allDeliveredIds.length,
       deleted,
       statusUpdated,
