@@ -1,11 +1,12 @@
 import { NextResponse } from 'next/server';
 import { sql } from '@vercel/postgres';
+import { lookupTracking, type TrackingResult } from '@/lib/carrier-tracking';
 
 /**
  * Delivery Check & Cleanup endpoint.
  *
- * Checks tracking numbers against UPS/FedEx APIs to find delivered packages,
- * then removes confirmed-delivered orders from the tracker.
+ * Checks tracking numbers against the carrier tracking provider (EasyPost) to find
+ * delivered packages, then removes confirmed-delivered orders from the tracker.
  *
  * POST /api/delivery-check?secret=SYNC_SECRET
  *
@@ -13,145 +14,18 @@ import { sql } from '@vercel/postgres';
  *   - secret: required auth token
  *   - dry_run=true: just report what would be deleted, don't delete
  *   - age_days=7: also mark orders older than N days with tracking as delivered (default 7)
+ *   - delete=false: update status to Delivered instead of deleting
+ *   - force=true: override the blast-radius guard
+ *
+ * 2026-09-18: the lookup layer was scraped consumer endpoints (ups.com / fedex.com)
+ * that started returning bot-challenge HTML. Replaced with EasyPost; see
+ * src/lib/carrier-tracking.ts. Carrier detection is now EasyPost's job, so tracking
+ * numbers that match neither the old "1Z..." nor the old digits-only pattern are no
+ * longer stranded in an unverifiable bucket.
  */
 
-interface TrackingResult {
-  tracking_number: string;
-  delivered: boolean;
-  status: string;
-  delivery_date?: string;
-}
-
-// Check UPS tracking numbers via their public web API
-async function checkUPSBatch(trackingNumbers: string[]): Promise<TrackingResult[]> {
-  const results: TrackingResult[] = [];
-
-  try {
-    const resp = await fetch('https://www.ups.com/track/api/Track/GetStatus?loc=en_US', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Origin': 'https://www.ups.com',
-        'Referer': 'https://www.ups.com/track?loc=en_US',
-      },
-      body: JSON.stringify({
-        Locale: 'en_US',
-        TrackingNumber: trackingNumbers,
-      }),
-    });
-
-    if (!resp.ok) {
-      console.log(`UPS API returned ${resp.status} — falling back to age-based check`);
-      return trackingNumbers.map(t => ({
-        tracking_number: t,
-        delivered: false,
-        status: `API error: ${resp.status}`,
-      }));
-    }
-
-    const data = await resp.json();
-
-    if (data.trackDetails && Array.isArray(data.trackDetails)) {
-      for (const detail of data.trackDetails) {
-        const trackNum = detail.trackingNumber || '';
-        const status = detail.packageStatus || '';
-        const delivered = status.toLowerCase().includes('delivered');
-        const deliveryDate = detail.deliveredDate || detail.deliveryInformation?.deliveryDate || undefined;
-
-        results.push({
-          tracking_number: trackNum,
-          delivered,
-          status,
-          delivery_date: deliveryDate,
-        });
-      }
-    }
-  } catch (err) {
-    console.error('UPS API error:', err);
-    return trackingNumbers.map(t => ({
-      tracking_number: t,
-      delivered: false,
-      status: `API error: ${String(err)}`,
-    }));
-  }
-
-  return results;
-}
-
-// Check FedEx tracking numbers
-async function checkFedExBatch(trackingNumbers: string[]): Promise<TrackingResult[]> {
-  const results: TrackingResult[] = [];
-
-  try {
-    const trackingList = trackingNumbers.map(t => ({
-      trackNumberInfo: {
-        trackingNumber: t,
-        trackingQualifier: '',
-        trackingCarrier: '',
-      },
-    }));
-
-    const payload = {
-      TrackPackagesRequest: {
-        appType: 'WTRK',
-        appDeviceType: 'DESKTOP',
-        supportHTML: true,
-        supportCurrentLocation: true,
-        uniqueKey: '',
-        processingParameters: {},
-        trackingInfoList: trackingList,
-      },
-    };
-
-    const resp = await fetch('https://www.fedex.com/trackingCal/track', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Referer': 'https://www.fedex.com/fedextrack/',
-      },
-      body: `data=${encodeURIComponent(JSON.stringify(payload))}&action=trackpackages&locale=en_US&version=1&format=json`,
-    });
-
-    if (!resp.ok) {
-      console.log(`FedEx API returned ${resp.status} — falling back to age-based check`);
-      return trackingNumbers.map(t => ({
-        tracking_number: t,
-        delivered: false,
-        status: `API error: ${resp.status}`,
-      }));
-    }
-
-    const data = await resp.json();
-
-    if (data.TrackPackagesResponse?.packageList) {
-      for (const pkg of data.TrackPackagesResponse.packageList) {
-        const trackNum = pkg.trackingNbr || '';
-        const status = pkg.keyStatus || '';
-        const delivered = status.toLowerCase().includes('delivered');
-        const deliveryDate = pkg.displayActDeliveryDt || undefined;
-
-        results.push({
-          tracking_number: trackNum,
-          delivered,
-          status,
-          delivery_date: deliveryDate,
-        });
-      }
-    }
-  } catch (err) {
-    console.error('FedEx API error:', err);
-    return trackingNumbers.map(t => ({
-      tracking_number: t,
-      delivered: false,
-      status: `API error: ${String(err)}`,
-    }));
-  }
-
-  return results;
-}
+// Up to ~200 lookups per run, run concurrently. Vercel clamps this to the plan maximum.
+export const maxDuration = 300;
 
 export async function POST(request: Request) {
   try {
@@ -181,66 +55,35 @@ export async function POST(request: Request) {
 
     console.log(`Found ${orders.length} orders with tracking to check`);
 
-    // Separate by carrier
-    const upsOrders = orders.filter(o => (o.tracking_number || '').startsWith('1Z'));
-    const fedexOrders = orders.filter(o =>
-      !(o.tracking_number || '').startsWith('1Z') &&
-      /^\d{10,22}$/.test(o.tracking_number || '')
+    // One lookup path for every tracked order. EasyPost auto-detects the carrier from
+    // the tracking code; the vendor's own carrier column is passed only as a hint.
+    const apiResults: TrackingResult[] = await lookupTracking(
+      orders.map(o => ({
+        tracking_number: o.tracking_number as string,
+        carrier_hint: o.carrier as string | null,
+      })),
     );
-    const otherOrders = orders.filter(o =>
-      !upsOrders.includes(o) && !fedexOrders.includes(o)
-    );
+
+    const resultByTracking = new Map<string, TrackingResult>();
+    for (const r of apiResults) resultByTracking.set(r.tracking_number, r);
 
     const deliveredIds: number[] = [];
-    const apiResults: TrackingResult[] = [];
-
-    // Check UPS in batches of 25
-    for (let i = 0; i < upsOrders.length; i += 25) {
-      const batch = upsOrders.slice(i, i + 25);
-      const trackingNums = batch.map(o => o.tracking_number);
-      const results = await checkUPSBatch(trackingNums);
-      apiResults.push(...results);
-
-      for (const result of results) {
-        if (result.delivered) {
-          const order = batch.find(o => o.tracking_number === result.tracking_number);
-          if (order) deliveredIds.push(order.id);
-        }
-      }
-
-      // Small delay between batches to avoid rate limiting
-      if (i + 25 < upsOrders.length) {
-        await new Promise(r => setTimeout(r, 500));
-      }
-    }
-
-    // Check FedEx in batches of 25
-    for (let i = 0; i < fedexOrders.length; i += 25) {
-      const batch = fedexOrders.slice(i, i + 25);
-      const trackingNums = batch.map(o => o.tracking_number);
-      const results = await checkFedExBatch(trackingNums);
-      apiResults.push(...results);
-
-      for (const result of results) {
-        if (result.delivered) {
-          const order = batch.find(o => o.tracking_number === result.tracking_number);
-          if (order) deliveredIds.push(order.id);
-        }
-      }
-
-      if (i + 25 < fedexOrders.length) {
-        await new Promise(r => setTimeout(r, 500));
-      }
+    for (const order of orders) {
+      const result = resultByTracking.get(order.tracking_number || '');
+      if (result?.verified && result.delivered) deliveredIds.push(order.id);
     }
 
     // Which tracking numbers actually got a real answer from the carrier?
     // A failed lookup must NOT feed the age rule. Otherwise a carrier outage
     // silently reclassifies "could not verify" as "old enough to delete", which is
-    // how a broken UPS/FedEx integration can empty the entire tracker. (2026-09-18)
+    // how a broken carrier integration can empty the entire tracker. (2026-09-18)
+    //
+    // This used to sniff for an "API error" prefix on the status string. It is now an
+    // explicit `verified` flag set by the lookup layer, which also covers the case of a
+    // successful HTTP call that carries no usable carrier data ("unknown"). Strictly
+    // narrower than before: nothing that was excluded is now included.
     const lookupOk = new Set(
-      apiResults
-        .filter(r => !String(r.status || '').startsWith('API error'))
-        .map(r => r.tracking_number)
+      apiResults.filter(r => r.verified).map(r => r.tracking_number),
     );
 
     // Age-based rule: only applies to orders the carrier actually answered for.
@@ -313,15 +156,31 @@ export async function POST(request: Request) {
       junkRemoved = rowCount || 0;
     }
 
+    // Breakdown by the carrier EasyPost actually resolved, rather than by guessing from
+    // the shape of the tracking number.
+    const breakdown: Record<string, number> = { ups: 0, fedex: 0, other: 0 };
+    const unresolved: Array<{ tracking: string; vendor: string; status: string }> = [];
+    for (const order of orders) {
+      const result = resultByTracking.get(order.tracking_number || '');
+      const carrier = (result?.detected_carrier || '').toLowerCase();
+      if (carrier.includes('ups')) breakdown.ups++;
+      else if (carrier.includes('fedex')) breakdown.fedex++;
+      else breakdown.other++;
+
+      if (!result?.verified) {
+        unresolved.push({
+          tracking: order.tracking_number as string,
+          vendor: order.vendor as string,
+          status: result?.status || 'no result',
+        });
+      }
+    }
+
     return NextResponse.json({
       timestamp: new Date().toISOString(),
       dryRun,
       totalChecked: orders.length,
-      breakdown: {
-        ups: upsOrders.length,
-        fedex: fedexOrders.length,
-        other: otherOrders.length,
-      },
+      breakdown,
       apiConfirmedDelivered: deliveredIds.length,
       agedOutDelivered: agedOutIds.length,
       ageSkippedUnverified,
@@ -338,7 +197,10 @@ export async function POST(request: Request) {
         tracking: r.tracking_number,
         status: r.status,
         delivered: r.delivered,
+        carrier: r.detected_carrier,
       })),
+      // Every order the carrier could not give a usable answer for. These never age out.
+      unresolved: unresolved.slice(0, 25),
       deliveredOrderIds: dryRun ? allDeliveredIds : undefined,
     });
   } catch (error) {
